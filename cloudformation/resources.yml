@@ -1,0 +1,882 @@
+Parameters:
+  #프로젝트 명
+  ProjectName:
+    Type: String
+    Description: projectname
+    Default: demo-ec2-ci-cd
+  #codecommit repo 명
+  RepositoryName:
+    Description: CodeCommit repository name
+    Type: String
+    Default: demo-ec2-ci-cd
+  #codecommit의 브렌치 명
+  BranchName:
+    Description: CodeCommit branch name
+    Type: String
+    Default: dev
+  #알람을 받을 이메일 주소, 반드시 subscription을 해야 그 다음부터 이메일 수신 가능
+  MyEmailAddress:
+    Description: MyEmailAddress
+    Type: String
+  #빌드 스테이지
+  BuildStage:
+    Description: build stage
+    Type: String
+    Default: dev
+  #초기 ASG 인스턴스 min
+  ASGMinSize:
+    Description: ASGMinSize
+    Type: String
+    Default: 1
+  #초기 ASG 인스턴스 desired
+  ASGDesiredSize:
+    Description: ASGDesiredSize
+    Type: String
+    Default: 1
+  #초기 ASG 인스턴스 max
+  ASGMaxSize:
+    Description: ASGMinSize
+    Type: String
+    Default: 5
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for ASG
+  #현재 리전의 SSM에서 AmazonLinux2 AMI를 자동으로 가져온다
+  LatestLinuxAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    # obtain list with
+    # aws ssm get-parameters-by-path --path /aws/service/ami-amazon-linux-latest  --query 'Parameters[].Name'
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+
+Resources:
+  #s3 버킷 비우기를 위한 역할
+  EmptyS3LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:*"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+
+  #s3 버킷을 비우는 Lambda함수
+  EmptyS3BucketLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.handler"
+      Role:
+        Fn::GetAtt:
+          - "EmptyS3LambdaExecutionRole"
+          - "Arn"
+      Runtime: "python3.7"
+      Timeout: 600
+      Code:
+        ZipFile: |
+          #!/usr/bin/env python
+          # -*- coding: utf-8 -*-
+          import json
+          import boto3
+          from botocore.vendored import requests
+
+          def handler(event, context):
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  if event['RequestType'] == 'Delete':
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(bucket)
+                      for obj in bucket.objects.filter():
+                          s3.Object(bucket.name, obj.key).delete()
+                  sendResponseCfn(event, context, "SUCCESS")
+              except Exception as e:
+                  print(e)
+                  sendResponseCfn(event, context, "FAILED")
+
+          def sendResponseCfn(event, context, responseStatus):
+              response_body = {'Status': responseStatus,
+                              'Reason': 'Log stream name: ' + context.log_stream_name,
+                              'PhysicalResourceId': context.log_stream_name,
+                              'StackId': event['StackId'],
+                              'RequestId': event['RequestId'],
+                              'LogicalResourceId': event['LogicalResourceId'],
+                              'Data': json.loads("{}")}
+              requests.put(event['ResponseURL'], data=json.dumps(response_body))
+  #SQS Queue
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-image-resize-queue"
+      VisibilityTimeout: 120
+  #SQS를 주소 및 이름를 담는 SSM Parameter Store
+  PreProcessqueueSSMParms:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "/${ProjectName}/${BuildStage}/preprocess-queue"
+      Type: String
+      Value: !Ref SQSQueue
+      Description: InitialQueueSSMParms
+  ProcessqueueNameSSMParms:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "/${ProjectName}/${BuildStage}/preprocess-queue-name"
+      Type: String
+      Value: !Sub "/${ProjectName}-image-resize-queue"
+      Description: InitialQueueSSMParms
+  #SNS 알람 토픽, 이메일을 Subscription으로 두고 있음
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref MyEmailAddress
+          Protocol: email
+  #우리가 사용할 이미지를 업로드할 S3 버킷. 중복되지 않도록  AccountId를 앞에 명시
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${ProjectName}-ec2-image-resize"
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: images/
+            Queue:
+              Fn::GetAtt:
+                - "SQSQueue"
+                - "Arn"
+    DependsOn: SQSQueuePolicy
+  #S3가 SQS Queue를 사용할 수 있도록 허락하는 Policy
+  SQSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: "*"
+            Action: SQS:SendMessage
+            Resource: "*"
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${AWS::AccountId}-${ProjectName}-ec2-image-resize"
+      Queues:
+        - Ref: SQSQueue
+  #S3버킷이 삭제될 때 내용을 삭제하는 함수
+  LambdaUsedToCleanUpImageBucket:
+    Type: Custom::cleanupbucket
+    Properties:
+      ServiceToken: !GetAtt EmptyS3BucketLambda.Arn
+      BucketName: !Ref ImageBucket
+  #EC2
+  #인스턴스 모든 권한을 포함
+  InstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        [
+          arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy,
+          "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+          "arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM",
+          "arn:aws:iam::aws:policy/AmazonS3FullAccess",
+          "arn:aws:iam::aws:policy/AmazonSQSFullAccess",
+          "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
+          "arn:aws:iam::aws:policy/AutoScalingFullAccess",
+        ]
+      # Policies:
+      #   - PolicyName: asg
+      #     PolicyDocument:
+      #       Version: 2012-10-17
+      #       Statement:
+      #         - Action:
+      #             - autoscaling:*
+      #           Resource: "*"
+
+      #           Effect: Allow
+  #CloudFormation에서 인스턴스에 Role을 할당하기 위해서는 InstanceProfile을 생성해주고 연결시켜주어야 한다.
+  InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstanceRole
+  #EC2에서 사용할 SG
+  SSHSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: 22
+          IpProtocol: tcp
+          ToPort: 22
+  #Autoscaling에서 사용할 LaunchTemplate
+
+  MyLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-launch-template
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - Ebs:
+              VolumeSize: 10
+              VolumeType: standard
+            DeviceName: /dev/xvdcz
+        ImageId: !Ref LatestLinuxAmiId
+        InstanceType: t2.micro
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds:
+          - !GetAtt SSHSecurityGroup.GroupId
+        #Node 16를 설치하고 CodeDeploy를 설치하는 UserData. 항상 CodeDeploy를 맨 마지막에 설치한다.
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            # install node:
+            # get node into yum
+            curl --silent --location https://rpm.nodesource.com/setup_16.x | bash -
+            # install node (and npm) with yum
+            yum -y install nodejs
+            npm i cross-env -g
+            # use this for user data when creating a new ec2 instance to support codedeploy and nodejs
+            # output user data logs into a separate place for debugging
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+            # install code deploy agent:
+            yum -y update
+            yum install -y ruby
+            yum install -y aws-cli
+            cd /home/ec2-user
+            aws s3 cp s3://aws-codedeploy-us-east-2/latest/install . --region us-east-2
+            chmod +x ./install
+            ./install auto
+
+  #Ec2 AutoScaling Group
+  MyASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MyLaunchTemplate
+        Version: !GetAtt MyLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref ASGMinSize
+      MaxSize: !Ref ASGMaxSize
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-ec2-image-resize"
+          PropagateAtLaunch: "true"
+      DesiredCapacity: !Ref ASGDesiredSize
+      # LifecycleHookSpecificationList:
+      #   - DefaultResult: CONTINUE
+      #     HeartbeatTimeout: !Ref MaxTimeToPrcoess
+      #     LifecycleTransition: "autoscaling:EC2_INSTANCE_TERMINATING"
+      #     LifecycleHookName: "WaitTermination"
+      MetricsCollection:
+        - Granularity: "1Minute"
+          Metrics:
+            - "GroupMinSize"
+            - "GroupMaxSize"
+            - "GroupDesiredCapacity"
+            - "GroupInServiceInstances"
+            - "GroupPendingInstances"
+            - "GroupStandbyInstances"
+            - "GroupTerminatingInstances"
+            - "GroupTotalInstances"
+            - "GroupInServiceCapacity"
+            - "GroupTotalCapacity"
+  #Autoscaling 이름을 저장할 SSM Parameter Store
+  ASGNameSSMParms:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "/${ProjectName}/${BuildStage}/asg"
+      Type: String
+      Value:
+        Ref: MyASG
+      Description: ASG_NAME
+
+  #CodeDeploy에서 활용할 Role
+  CodeDeployServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        [arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole]
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub "${AWS::StackName}-CodeDeploy"
+      ComputePlatform: Server
+
+  #이하 CodeDeploy
+  MyDeploymentConfig:
+    Type: AWS::CodeDeploy::DeploymentConfig
+    Properties:
+      MinimumHealthyHosts:
+        Type: "HOST_COUNT"
+        Value: 0
+
+  MyDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentConfigName: !Ref MyDeploymentConfig
+      # Ec2TagFilters:
+      #   - Key: DeployTest
+      #     Type: KEY_ONLY
+      AutoScalingGroups:
+        - !Ref MyASG
+
+      DeploymentStyle:
+        DeploymentOption: WITHOUT_TRAFFIC_CONTROL
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      # TriggerConfigurations:
+      #   - TriggerEvents:
+      #       - DeploymentSuccess
+      #       - DeploymentFailure
+      #     TriggerName: MyTarget
+      #     TriggerTargetArn: !Ref mySNSTopic
+
+  #아티펙트 저장용 S3
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      AccessControl: Private
+  LambdaUsedToCleanUpArtifactBucket:
+    Type: Custom::cleanupbucket
+    Properties:
+      ServiceToken: !GetAtt EmptyS3BucketLambda.Arn
+      BucketName: !Ref ArtifactStoreBucket
+
+  #이하 파이프라인
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Policies:
+        - PolicyName: codebuild
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::codepipeline-${AWS::Region}-*/*"
+
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action:
+                  - iam:GetServiceLinkedRoleDeletionStatus
+                  - cloudwatch:GetInsightRuleReport
+                  - apigateway:*
+                  - iam:DeleteServiceLinkedRole
+                Resource:
+                  - arn:aws:cloudwatch:*:*:insight-rule/DynamoDBContributorInsights*
+                  - arn:aws:iam::*:role/aws-service-role/ssm.amazonaws.com/AWSServiceRoleForAmazonSSM*
+                  - arn:aws:apigateway:*::/*
+              - Sid: VisualEditor1
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:DeleteAlarms
+                  - lambda:GetFunctionConfiguration
+                  - xray:PutTraceSegments
+                  - datapipeline:CreatePipeline
+                  - kinesis:ListStreams
+                  - sns:Subscribe
+                  - lambda:DeleteFunction
+                  - iam:ListRolePolicies
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ListStackResources
+                  - sns:*
+                  - iam:GetRole
+                  - sns:ListSubscriptionsByTopic
+                  - datapipeline:ListPipelines
+                  - iam:GetPolicy
+                  - lambda:ListFunctions
+                  - sqs:SendMessage
+                  - application-autoscaling:DeleteScalingPolicy
+                  - cloudwatch:GetMetricStatistics
+                  - iot:CreateTopicRule
+                  - resource-groups:CreateGroup
+                  - cloudwatch:*
+                  - application-autoscaling:DescribeScalingPolicies
+                  - cloudwatch:DescribeAlarms
+                  - iot:ListPolicies
+                  - resource-groups:ListGroupResources
+                  - ec2:DescribeSubnets
+                  - datapipeline:ActivatePipeline
+                  - lambda:DeleteEventSourceMapping
+                  - iot:ListThings
+                  - iam:GetRolePolicy
+                  - iot:ReplaceTopicRule
+                  - tag:GetResources
+                  - xray:PutTelemetryRecords
+                  - iot:AttachThingPrincipal
+                  - cognito-identity:ListIdentityPools
+                  - sns:ListTopics
+                  - iot:CreatePolicy
+                  - ssmmessages:OpenControlChannel
+                  - datapipeline:DescribePipelines
+                  - cloudwatch:ListMetrics
+                  - iam:PassRole
+                  - cloudwatch:DescribeAlarmHistory
+                  - ssmmessages:OpenDataChannel
+                  - iot:CreateKeysAndCertificate
+                  - ec2:DescribeInstanceStatus
+                  - s3:*
+                  - iot:AttachPrincipalPolicy
+                  - datapipeline:QueryObjects
+                  - iam:ListRoles
+                  - kinesis:DescribeStream
+                  - sns:ListSubscriptions
+                  - ssmmessages:CreateControlChannel
+                  - ec2:DescribeSecurityGroups
+                  - ssmmessages:CreateDataChannel
+                  - resource-groups:DeleteGroup
+                  - ec2:DescribeVpcs
+                  - ssm:*
+                  - kms:ListAliases
+                  - iam:GetPolicyVersion
+                  - logs:*
+                  - ds:CreateComputer
+                  - sns:Unsubscribe
+                  - dynamodb:*
+                  - iot:DescribeEndpoint
+                  - cognito-sync:SetCognitoEvents
+                  - resource-groups:GetGroup
+                  - iam:ListAttachedRolePolicies
+                  - cloudwatch:DescribeAlarmsForMetric
+                  - ec2messages:*
+                  - events:*
+                  - application-autoscaling:RegisterScalableTarget
+                  - dax:*
+                  - iot:GetTopicRule
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:*
+                  - cloudformation:DescribeStacks
+                  - kinesis:PutRecord
+                  - cloudformation:GetTemplate
+                  - application-autoscaling:PutScalingPolicy
+                  - lambda:ListEventSourceMappings
+                  - resource-groups:GetGroupQuery
+                  - lambda:CreateEventSourceMapping
+                  - sns:Publish
+                  - cognito-sync:GetCognitoEvents
+                  - application-autoscaling:DescribeScalingActivities
+                  - kms:DescribeKey
+                  - iot:ListTopicRules
+                  - sqs:ListQueues
+                  - datapipeline:PutPipelineDefinition
+                  - iot:CreateThing
+                  - application-autoscaling:DescribeScalableTargets
+                  - datapipeline:DescribeObjects
+                  - datapipeline:GetPipelineDefinition
+                  - resource-groups:ListGroups
+                  - cloudwatch:PutMetricAlarm
+                  - lambda:*
+                  - ds:DescribeDirectories
+                  - datapipeline:DeletePipeline
+                  - application-autoscaling:DeregisterScalableTarget
+                Resource: "*"
+              - Sid: VisualEditor2
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: "*"
+                Condition:
+                  StringLike:
+                    iam:PassedToService:
+                      - application-autoscaling.amazonaws.com
+                      - dax.amazonaws.com
+              - Sid: VisualEditor3
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - replication.dynamodb.amazonaws.com
+                      - dax.amazonaws.com
+                      - dynamodb.application-autoscaling.amazonaws.com
+                      - contributorinsights.dynamodb.amazonaws.com
+              - Sid: VisualEditor4
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: arn:aws:iam::*:role/aws-service-role/ssm.amazonaws.com/AWSServiceRoleForAmazonSSM*
+                Condition:
+                  StringLike:
+                    iam:AWSServiceName: ssm.amazonaws.com
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-codebuild"
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: linuxContainer
+        # ComputeType options: BUILD_GENERAL1_SMALL, BUILD_GENERAL1_MEDIUM, BUILD_GENERAL1_LARGE
+        ComputeType: BUILD_GENERAL1_SMALL
+        # Run `aws codebuild list-curated-environment-images` for a complete list of images provided.
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        EnvironmentVariables:
+          - Name: build_stage
+            Value: !Ref BuildStage
+          - Name: repoName
+            Value: !Ref RepositoryName
+          - Name: queue_url
+            Value: !Sub "/${ProjectName}/${BuildStage}/preprocess-queue"
+          - Name: region
+            Value: !Sub "${AWS::Region}"
+          - Name: asg_name
+            Value: !Sub "/${ProjectName}/${BuildStage}/asg"
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 10
+
+  #codepipeline
+  AmazonCloudWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - events.amazonaws.com
+      Policies:
+        - PolicyName: codepipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource:
+                  - !Join [
+                      "",
+                      [
+                        "arn:aws:codepipeline:",
+                        !Ref "AWS::Region",
+                        ":",
+                        !Ref "AWS::AccountId",
+                        ":",
+                        !Ref AppPipeline,
+                      ],
+                    ]
+
+  CloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger CodePipeline on Trigger
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - "CodeCommit Repository State Change"
+        resources:
+          - !Join [
+              "",
+              [
+                "arn:aws:codecommit:",
+                !Ref "AWS::Region",
+                ":",
+                !Ref "AWS::AccountId",
+                ":",
+                !Ref RepositoryName,
+              ],
+            ]
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref BranchName
+      # Name: CodePipelineTrigger
+      Targets:
+        - Arn:
+            !Join [
+              "",
+              [
+                "arn:aws:codepipeline:",
+                !Ref "AWS::Region",
+                ":",
+                !Ref "AWS::AccountId",
+                ":",
+                !Ref AppPipeline,
+              ],
+            ]
+          RoleArn: !GetAtt AmazonCloudWatchEventRole.Arn
+          Id: codepipeline-AppPipeline
+  CodePipelineServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+
+      Policies:
+        - PolicyName: codepipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - iam:PassRole
+                Resource: "*"
+                Effect: Allow
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService:
+                      - cloudformation.amazonaws.com
+                      - elasticbeanstalk.amazonaws.com
+                      - ec2.amazonaws.com
+                      - ecs-tasks.amazonaws.com
+              - Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - codestar-connections:UseConnection
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - elasticbeanstalk:*
+                  - ec2:*
+                  - elasticloadbalancing:*
+                  - autoscaling:*
+                  - cloudwatch:*
+                  - s3:*
+                  - sns:*
+                  - cloudformation:*
+                  - rds:*
+                  - sqs:*
+                  - ecs:*
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - lambda:InvokeFunction
+                  - lambda:ListFunctions
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - opsworks:CreateDeployment
+                  - opsworks:DescribeApps
+                  - opsworks:DescribeCommands
+                  - opsworks:DescribeDeployments
+                  - opsworks:DescribeInstances
+                  - opsworks:DescribeStacks
+                  - opsworks:UpdateApp
+                  - opsworks:UpdateStack
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuildBatches
+                  - codebuild:StartBuildBatch
+                Resource: "*"
+                Effect: Allow
+              - Effect: Allow
+                Action:
+                  - devicefarm:ListProjects
+                  - devicefarm:ListDevicePools
+                  - devicefarm:GetRun
+                  - devicefarm:GetUpload
+                  - devicefarm:CreateUpload
+                  - devicefarm:ScheduleRun
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - servicecatalog:ListProvisioningArtifacts
+                  - servicecatalog:CreateProvisioningArtifact
+                  - servicecatalog:DescribeProvisioningArtifact
+                  - servicecatalog:DeleteProvisioningArtifact
+                  - servicecatalog:UpdateProduct
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:DescribeImages
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:DescribeStateMachine
+                  - states:StartExecution
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - appconfig:StartDeployment
+                  - appconfig:StopDeployment
+                  - appconfig:GetDeployment
+                Resource: "*"
+
+  AppPipeline:
+    Type: "AWS::CodePipeline::Pipeline"
+    Properties:
+      Name: !Sub "${AWS::StackName}"
+      RoleArn: !GetAtt
+        - CodePipelineServiceRole
+        - Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                BranchName: !Ref BranchName
+                RepositoryName: !Ref RepositoryName
+                PollForSourceChanges: false
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              InputArtifacts:
+                - Name: SourceOutput
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Sub "${AWS::StackName}-codebuild"
+              RunOrder: 1
+        - Name: Approval
+          Actions:
+            - ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: "1"
+              Configuration:
+                NotificationArn: !Ref AlarmTopic
+              InputArtifacts: []
+              Name: Approval
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: CodeDeply
+              InputArtifacts:
+                - Name: BuildArtifact
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CodeDeploy
+              Configuration:
+                ApplicationName: !Sub "${AWS::StackName}-CodeDeploy"
+                DeploymentGroupName: !Ref MyDeploymentGroup
+              RunOrder: 1
+
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactStoreBucket

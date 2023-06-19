@@ -1,0 +1,43 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      #node 16 설치
+      - n 16.15.0
+      #yarn 설치
+      - "npm install yarn -g"
+  build:
+    commands:
+      # dependency update
+      - yarn
+      # 환경변수 설정 여부 echo
+      - echo $queue_url
+      # Systems Manager Parameter Store 에서 sqs queue url 조회
+      - 'QUEUE_URL=`aws ssm get-parameter --name "$queue_url" --region ap-northeast-2 --output text | awk ''{print $7}''`'
+      # Systems Manager Parameter Store 에서 Autoscaling Group 이름 조회
+      - 'ASG_Name=`aws ssm get-parameter --name "$asg_name" --region ap-northeast-2 --output text | awk ''{print $7}''`'
+      # queue url 와 ASG 이름을 .env에 기록
+      - echo -e "\nQUEUE_URL="$QUEUE_URL"" >> .env
+      - echo -e "\nASG_Name="$ASG_Name"" >> .env
+      # 잘 들어갔나 확인
+      - cat .env
+      # 아티펙트 생성을 위한 디렉토리 생성 및 파일 카피
+      # 사실 이 부분은 그냥 예제로 실제 어플리케이션의 빌드를 모방한 것일 뿐 실전에선 별 의미 없음(그냥 아티펙트 디렉토리 없이 파일을 넘겨도 무방함)
+      - mkdir build
+      - mkdir build/src
+      - cp -r src/* build/src/
+      - mkdir build/node_modules
+      - cp -r node_modules/* build/node_modules/
+      - mkdir build/scripts
+      - cp -r scripts/ build/
+      - cp .env build/
+      - cp appspec.yml build/
+  post_build:
+    commands:
+      - ls
+artifacts:
+  files:
+    - "**/*"
+  # 이 빌드 과정의 결과물(=아티펙트)의 경로 명시
+  base-directory: ./build
